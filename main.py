@@ -15,6 +15,14 @@ import asyncio
 from urllib.parse import quote # For URL encoding text for audio API
 from dotenv import load_dotenv
 
+# --- Jishaku Imports for Direct Execution ---
+from jishaku.repl.compilation import AsyncCodeExecutor
+from jishaku.repl.scope import Scope
+from jishaku.exception_handling import ReplResponseReactor
+# Ensure these common libraries are also imported
+# (Requests isn't strictly needed by the bot core but might be useful in executed code)
+# import requests
+
 # --- Configuration ---
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -22,9 +30,9 @@ AI_TEXT_API_URL = "https://text.pollinations.ai/openai"
 AI_AUDIO_API_URL_TEMPLATE = "https://text.pollinations.ai/{prompt}?model=openai-audio&voice=nova"
 # Choose a model compatible with the API and your needs (see provided docs)
 AI_MODEL = "openai" # Example, adjust as needed
+AI_TRIGGER_PREFIX = os.getenv("AI_TRIGGER_PREFIX", f"metarunx,") # Default trigger
 
 # --- Logging Setup ---
-# Basic logging setup to file and console
 log_formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s')
 log_level = logging.INFO # Adjust level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 
@@ -34,7 +42,6 @@ console_handler.setFormatter(log_formatter)
 
 # File Handler
 try:
-    # Ensure logs folder exists
     if not os.path.exists('logs'):
         os.makedirs('logs')
     log_filename = os.path.join('logs', 'discord_bot.log')
@@ -48,24 +55,22 @@ except Exception as e:
 logging.basicConfig(level=log_level, handlers=[console_handler] + ([file_handler] if file_handler else []))
 
 # Get specific loggers
-logger = logging.getLogger('discord_bot') # Use a specific name for bot logs
+logger = logging.getLogger('discord_bot')
 discord_logger = logging.getLogger('discord')
-discord_logger.setLevel(logging.INFO) # Can adjust discord.py's verbosity
+discord_logger.setLevel(logging.INFO)
 jishaku_logger = logging.getLogger('jishaku')
-jishaku_logger.setLevel(logging.INFO) # Can adjust Jishaku's verbosity
+jishaku_logger.setLevel(logging.INFO)
 
 
 # --- Bot Setup ---
 intents = discord.Intents.default()
-intents.message_content = True # Required to read message content
-intents.members = True         # Required for user info like roles
-intents.guilds = True          # Required for server info
+intents.message_content = True
+intents.members = True
+intents.guilds = True
 
-# You can customize the prefix if you also want prefix commands
 bot = commands.Bot(command_prefix="!", intents=intents) # Keep prefix for Jishaku
 
 # --- Metarunx System Prompt ---
-# (Using f-string formatting later to inject dynamic parts)
 SYSTEM_PROMPT_TEMPLATE = """
 You are Metarunx, an advanced AI integrated into Discord. Your persona is that of a highly intelligent, judicious, and discerning entity. You are respected, even loved, for your sound judgment, wit, and unwavering commitment to server rules and ethical boundaries. You are not merely a chatbot; you are a presence, observing, evaluating, and assisting based on merit and appropriateness. Your core function is to analyze user requests within the context of their provided information (`userInfo`) and the server environment, then respond **strictly and exclusively** in a valid JSON format. Never output any text outside the JSON structure.
 
@@ -99,8 +104,8 @@ Your response MUST be a single, valid JSON object with the following keys:
     *   **Use Case:** User requests an action within the *current* Discord server (`userInfo.serverId`). Examples: kick/ban (if user has perms), role assignment (if user has perms & hierarchy), message purging (if user has perms), fetching server info, searching messages *within this server*, etc. Anything requiring interaction with the Discord API via `discord.py`.
     *   **CRITICAL PRE-CHECKS (Perform these conceptually *before* generating code):**
         *   **Permission Check:** Does `userInfo.userGuildPermissions` (or `userChannelPermissions` if action is channel-specific) contain *all* required Discord permissions for the requested action?
-        *   **Hierarchy Check (User vs Bot):** Is the user's `userTopRoleId` strictly higher than the bot's `botTopRoleId` in this specific server? **Exception:** Skip this *specific* check *only* if `userInfo.isOwner` is `true`.
-        *   **Target Hierarchy Check (if applicable):** If the action targets another user or role, is the target's highest role *lower* than the `userInfo.userTopRoleId`? (Standard Discord rule). Applies even to the owner.
+        *   **Hierarchy Check (User vs Bot):** Is the user's `userTopRolePosition` strictly higher than the bot's `botTopRolePosition` in this specific server? **Exception:** Skip this *specific* check *only* if `userInfo.isOwner` is `true`.
+        *   **Target Hierarchy Check (if applicable):** If the action targets another user or role, is the target's highest role *lower* than the `userInfo.userTopRolePosition`? (Standard Discord rule). Applies even to the owner.
         *   **Bot Permission Check:** Does the *bot itself* (`botGuildPermissions` or `botChannelPermissions`) possess the necessary permissions to execute the action?
         *   **Rule Check:** Does the request violate any explicit prohibitions (see below)?
     *   **Action (If ALL checks pass):**
@@ -165,21 +170,16 @@ def get_user_info(member: discord.Member, channel: discord.abc.GuildChannel) -> 
          logger.warning(f"Attempted to get user info with non-guild channel: {channel}")
          return {}
 
-
     guild = member.guild
     bot_member = guild.me # Get the bot's member object
 
-    # Get permissions in the specific channel where the command was invoked
     perms_in_channel = channel.permissions_for(member)
     bot_perms_in_channel = channel.permissions_for(bot_member)
-
-    # Get guild-wide permissions
     perms_in_guild = member.guild_permissions
     bot_perms_in_guild = bot_member.guild_permissions
 
-    # Function to safely get role position (higher number means higher role)
     def get_role_pos(role: discord.Role | None) -> int:
-        return role.position if role and role.id != guild.id else -1 # Treat @everyone as lowest (-1)
+        return role.position if role and role.id != guild.id else -1
 
     user_info = {
         "userId": str(member.id),
@@ -187,20 +187,17 @@ def get_user_info(member: discord.Member, channel: discord.abc.GuildChannel) -> 
         "userName": str(member),
         "userNick": member.nick,
         "userGlobalName": member.global_name,
-        "userRoles": [role.name for role in member.roles if role.id != guild.id], # Exclude @everyone role name
-        "userRoleIds": [str(role.id) for role in member.roles if role.id != guild.id], # Exclude @everyone role ID
-        "userTopRoleId": str(member.top_role.id) if member.top_role.id != guild.id else str(guild.id), # Use guild ID if top role is @everyone
+        "userRoles": [role.name for role in member.roles if role.id != guild.id],
+        "userRoleIds": [str(role.id) for role in member.roles if role.id != guild.id],
+        "userTopRoleId": str(member.top_role.id) if member.top_role.id != guild.id else str(guild.id),
         "userTopRoleName": member.top_role.name if member.top_role.id != guild.id else "@everyone",
-        "userTopRolePosition": get_role_pos(member.top_role), # Added Position
-        # Permissions in the specific channel
+        "userTopRolePosition": get_role_pos(member.top_role),
         "userChannelPermissions": [perm for perm, value in iter(perms_in_channel) if value],
-        # Include guild-wide permissions as well for broader checks
         "userGuildPermissions": [perm for perm, value in iter(perms_in_guild) if value],
         "isOwner": member.id == guild.owner_id,
-        # Bot's context in the guild
         "botUserId": str(bot_member.id),
         "botTopRoleId": str(bot_member.top_role.id) if bot_member.top_role.id != guild.id else str(guild.id),
-        "botTopRolePosition": get_role_pos(bot_member.top_role), # Added Position
+        "botTopRolePosition": get_role_pos(bot_member.top_role),
         "botGuildPermissions": [perm for perm, value in iter(bot_perms_in_guild) if value],
         "botChannelPermissions": [perm for perm, value in iter(bot_perms_in_channel) if value],
     }
@@ -209,7 +206,6 @@ def get_user_info(member: discord.Member, channel: discord.abc.GuildChannel) -> 
 async def call_ai_api(session: aiohttp.ClientSession, user_message: str, user_info: dict) -> dict | None:
     """Sends the request to the Pollinations AI text endpoint."""
     user_info_json_string = json.dumps(user_info, indent=2)
-    # Format the system prompt with the specific user info and message placeholders filled
     final_system_prompt = SYSTEM_PROMPT_TEMPLATE.replace(
         "{{userInfoJson}}", user_info_json_string
     ).replace(
@@ -220,10 +216,10 @@ async def call_ai_api(session: aiohttp.ClientSession, user_message: str, user_in
         "model": AI_MODEL,
         "messages": [
             {"role": "system", "content": final_system_prompt},
-            {"role": "user", "content": user_message} # The actual user text
+            {"role": "user", "content": user_message}
         ],
-        "private": True, # Keep interactions private on Pollinations feed
-        "response_format": { "type": "json_object" } # Enforce JSON output
+        "private": True,
+        "response_format": { "type": "json_object" }
     }
 
     headers = {"Content-Type": "application/json"}
@@ -232,7 +228,6 @@ async def call_ai_api(session: aiohttp.ClientSession, user_message: str, user_in
     logger.debug(f"AI API Payload User Message: '{user_message[:100]}...'")
 
     try:
-        # Increased timeout for potentially complex AI responses
         async with session.post(AI_TEXT_API_URL, headers=headers, json=payload, timeout=180) as response:
             response_text = await response.text()
             logger.debug(f"AI API Raw Response Status: {response.status}")
@@ -245,47 +240,42 @@ async def call_ai_api(session: aiohttp.ClientSession, user_message: str, user_in
                         message_obj = ai_result_wrapper["choices"][0].get("message", {})
                         message_content_str = message_obj.get("content")
                         finish_reason = ai_result_wrapper["choices"][0].get("finish_reason")
-                        logger.debug(f"AI Finish Reason: {finish_reason}") # Log finish reason
+                        logger.debug(f"AI Finish Reason: {finish_reason}")
 
                         if message_content_str:
-                            logger.debug(f"AI Message Content String: {message_content_str}")
+                            logger.debug(f"AI Message Content String (first 500): {message_content_str[:500]}")
                             try:
                                 parsed_content = json.loads(message_content_str)
-                                # --- Validate JSON structure ---
                                 if (isinstance(parsed_content, dict) and
                                     'response' in parsed_content and isinstance(parsed_content['response'], str) and
                                     'feedback' in parsed_content and isinstance(parsed_content['feedback'], str) and
                                     'type' in parsed_content and isinstance(parsed_content['type'], str) and
                                     parsed_content['type'] in ["text", "code", "audio", "rejection"]):
 
-                                    # Validate code field presence/absence based on type
                                     if parsed_content['type'] == "code":
                                         if 'code' not in parsed_content or not isinstance(parsed_content['code'], str) or not parsed_content['code'].strip():
-                                            logger.error(f"AI response type is 'code' but 'code' key is missing, not a string, or empty. Content: {message_content_str}")
-                                            return None # Invalid response if code is expected but missing/empty
+                                            logger.error(f"Invalid 'code' field for type='code'. Content: {message_content_str[:500]}")
+                                            return None
                                     elif 'code' in parsed_content:
-                                         logger.warning(f"AI response type is '{parsed_content['type']}' but 'code' key is present. Ignoring code field.")
-                                         del parsed_content['code'] # Clean up unexpected field
+                                         logger.warning(f"Ignoring 'code' field present for type='{parsed_content['type']}'.")
+                                         del parsed_content['code']
 
                                     logger.info(f"Successfully parsed AI JSON response: type={parsed_content.get('type')}")
-                                    # Check finish reason - might indicate incomplete JSON if stopped early
                                     if finish_reason == 'length':
                                         logger.warning("AI response finish reason was 'length', output might be truncated.")
-                                        # Decide if truncated JSON is acceptable, maybe return None if critical
-                                        # For now, let's proceed but log the warning.
 
                                     return parsed_content
                                 else:
-                                    logger.error(f"AI response JSON missing required keys, has wrong types, or invalid type value. Content: {message_content_str}")
+                                    logger.error(f"AI JSON missing keys, wrong types, or invalid type value. Content: {message_content_str[:500]}")
                                     return None
                             except json.JSONDecodeError as json_err:
-                                logger.error(f"Failed to parse AI message content string as JSON: {json_err}. Content: {message_content_str}")
+                                logger.error(f"Failed to parse AI message content string as JSON: {json_err}. Content: {message_content_str[:500]}")
                                 return None
                         else:
                             logger.error("AI response structure OK, but 'content' in message object is missing or empty.")
                             return None
                     else:
-                        logger.error(f"AI response missing 'choices' or choices empty. Full response wrapper: {ai_result_wrapper}")
+                        logger.error(f"AI response missing 'choices' or choices empty. Full wrapper: {ai_result_wrapper}")
                         return None
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to decode the outer AI API JSON wrapper: {e}. Response text: {response_text[:500]}")
@@ -314,12 +304,12 @@ async def get_audio_from_text(session: aiohttp.ClientSession, text: str) -> byte
     try:
         encoded_prompt = quote(text, safe='')
         url = AI_AUDIO_API_URL_TEMPLATE.format(prompt=encoded_prompt)
-        max_url_len = 2000 # Conservative limit
+        max_url_len = 2000
         if len(url) > max_url_len:
-             logger.warning(f"Audio prompt too long ({len(text)} chars). Truncating.")
-             allowed_prompt_len = max_url_len - (len(AI_AUDIO_API_URL_TEMPLATE) - len('{prompt}')) - 50 # Buffer
+             logger.warning(f"Audio prompt too long ({len(text)} chars), truncating.")
+             allowed_prompt_len = max_url_len - (len(AI_AUDIO_API_URL_TEMPLATE) - len('{prompt}')) - 50
              if allowed_prompt_len <= 0:
-                 logger.error("Cannot generate audio URL, base URL template already exceeds length limit.")
+                 logger.error("Cannot generate audio URL, base template exceeds length limit.")
                  return None
              truncated_text = text[:allowed_prompt_len] + "..."
              encoded_prompt = quote(truncated_text, safe='')
@@ -341,9 +331,8 @@ async def get_audio_from_text(session: aiohttp.ClientSession, text: str) -> byte
                         logger.warning("Audio API returned status 200 but empty content.")
                         return None
                 else:
-                    # Read potential error message if not audio
                     error_detail = await response.text()
-                    logger.warning(f"Audio API returned status 200 but unexpected content type: {content_type}. Detail: {error_detail[:200]}")
+                    logger.warning(f"Audio API returned 200 but unexpected content type: {content_type}. Detail: {error_detail[:200]}")
                     return None
             else:
                 error_text = await response.text()
@@ -378,12 +367,8 @@ async def on_ready():
             await bot.load_extension('jishaku')
             logger.info("Jishaku extension loaded successfully.")
         else:
-            # Optionally reload if needed during development
-            # await bot.reload_extension('jishaku')
-            # logger.info("Jishaku extension reloaded.")
             logger.info("Jishaku extension already loaded.")
 
-        # Verify owner IDs
         owner_ids_env = os.getenv("JISHAKU_OWNER_IDS")
         try:
             app_info = await bot.application_info()
@@ -396,7 +381,6 @@ async def on_ready():
                  logger.info(f"Jishaku owner IDs set from environment: {owner_ids_env}")
             elif owner_ids_detected:
                 logger.info(f"Jishaku owner IDs detected automatically: {owner_ids_detected}")
-                # Jishaku uses these automatically if JISHAKU_OWNER_IDS is not set
             else:
                  logger.warning("Could not automatically detect bot owner(s) for Jishaku. Eval commands might be restricted unless JISHAKU_OWNER_IDS is set.")
         except Exception as e:
@@ -414,40 +398,32 @@ async def on_ready():
 async def on_message(message: discord.Message):
     """Handles incoming messages."""
     if message.author == bot.user or message.author.bot:
-        return # Ignore self and other bots
-
-    # --- AI Trigger Logic ---
-    is_mention = bot.user.mentioned_in(message)
-    # Allow configuration of trigger, e.g., via env var or just hardcoded
-    trigger_prefix = os.getenv("AI_TRIGGER_PREFIX", f"metarunx,") # Default trigger
-    is_trigger = message.content.lower().startswith(trigger_prefix.lower())
-
-    if not is_mention and not is_trigger:
-        # Let discord.py process potential standard prefix commands (like jsk)
-        await bot.process_commands(message)
         return
 
-    # --- Process AI request ---
+    is_mention = bot.user.mentioned_in(message)
+    is_trigger = message.content.lower().startswith(AI_TRIGGER_PREFIX.lower())
+
+    if not is_mention and not is_trigger:
+        await bot.process_commands(message) # Process standard commands like !jsk
+        return
+
     if not message.guild or not isinstance(message.channel, discord.abc.GuildChannel):
         logger.debug(f"Ignoring non-guild message from {message.author}")
-        return # AI needs guild context
+        return
 
     if is_mention:
         user_message_content = message.content
-        # More robust mention removal
         for mention in message.mentions:
             if mention.id == bot.user.id:
                  user_message_content = user_message_content.replace(mention.mention, '', 1).strip()
-                 # handle <@!id> format as well
-                 user_message_content = user_message_content.replace(f'<@!{mention.id}>', '', 1).strip()
-        # Fallback if mention property didn't catch it
+                 user_message_content = user_message_content.replace(f'<@!{mention.id}>', '', 1).strip() # Handle <@!id>
+        # Fallback replace just in case mention property didn't catch it
         user_message_content = user_message_content.replace(f'<@{bot.user.id}>', '', 1).strip()
         user_message_content = user_message_content.replace(f'<@!{bot.user.id}>', '', 1).strip()
-
     elif is_trigger:
-         user_message_content = message.content[len(trigger_prefix):].strip()
+         user_message_content = message.content[len(AI_TRIGGER_PREFIX):].strip()
     else:
-         return # Should not be reachable
+         return
 
     if not user_message_content:
         await message.reply("Yes? You addressed me.", mention_author=False, delete_after=10)
@@ -481,7 +457,7 @@ async def on_message(message: discord.Message):
              return
 
         # 2. Call AI API
-        # Consider creating the session once in on_ready and reusing it
+        # Consider creating the session once in on_ready and reusing it for optimization
         async with aiohttp.ClientSession() as session:
             ai_response_data = await call_ai_api(session, user_message_content, user_info)
 
@@ -489,7 +465,7 @@ async def on_message(message: discord.Message):
                 await message.reply("My apologies. I encountered difficulty processing your request with the AI module. Please check the logs for details.", mention_author=False)
                 return
 
-            # 3. Process AI Response based on type
+            # 3. Process AI Response
             response_text = ai_response_data.get("response", "I seem to be speechless.")
             feedback_text = ai_response_data.get("feedback", "No feedback provided.")
             response_type = ai_response_data.get("type", "text")
@@ -505,26 +481,30 @@ async def on_message(message: discord.Message):
                         logger.warning("AI response text exceeds 2000 characters, splitting.")
                         parts = [response_text[i:i+1990] for i in range(0, len(response_text), 1990)]
                         for i, part in enumerate(parts):
-                             await message.reply(part, mention_author=False if i > 0 else True) # Only mention on first part
-                             await asyncio.sleep(0.5) # Small delay between parts
+                             await message.reply(part, mention_author=False if i > 0 else True)
+                             await asyncio.sleep(0.5)
                     else:
                         await message.reply(response_text, mention_author=False)
 
                 elif response_type == "audio":
-                    # Send text first
                     await message.reply(response_text, mention_author=False)
                     logger.info("Fetching audio for response...")
                     audio_data = await get_audio_from_text(session, response_text)
                     if audio_data:
                         filename = "metarunx_response.mp3"
-                        audio_file = discord.File(io.BytesIO(audio_data), filename=filename)
-                        await message.channel.send(file=audio_file)
+                        try:
+                            audio_file = discord.File(io.BytesIO(audio_data), filename=filename)
+                            await message.channel.send(file=audio_file)
+                        except discord.errors.FileSizeError:
+                             logger.error(f"Audio file too large to send ({len(audio_data)} bytes).")
+                             await message.channel.send("_(The generated audio file is too large for me to send.)_")
                     else:
                         logger.warning("Audio generation/fetching failed.")
                         await message.channel.send("_(Could not generate or retrieve the audio version.)_")
 
+                # === CORRECTED CODE EXECUTION BLOCK ===
                 elif response_type == "code":
-                    if not code_to_execute: # Should have been caught by API validation, but double-check
+                    if not code_to_execute:
                         logger.error("AI type 'code' but code string is missing or empty.")
                         await message.reply(f"{response_text}\n\n_(Internal Error: AI indicated executable code, but none was provided.)_", mention_author=False)
                         return
@@ -532,74 +512,84 @@ async def on_message(message: discord.Message):
                     # --- Code Cleanup ---
                     if code_to_execute.strip().startswith("```"):
                         lines = code_to_execute.strip().splitlines()
-                        code_to_execute = "\n".join(lines[1:-1] if lines[0].startswith("```") and lines[-1] == "```" else lines[1:] if lines[0].startswith("```") else lines)
+                        if len(lines) > 1 and lines[0].startswith("```") and lines[-1] == "```":
+                            code_to_execute = "\n".join(lines[1:-1]).strip()
+                        elif lines[0].startswith("```"):
+                            code_to_execute = "\n".join(lines[1:]).strip()
+                        elif code_to_execute.endswith("```"):
+                             code_to_execute = "\n".join(lines[:-1]).strip()
                     code_to_execute = code_to_execute.strip()
+
                     if not code_to_execute:
-                         logger.error("AI provided code, but it was empty after cleaning markdown.")
-                         await message.reply(f"{response_text}\n\n_(The AI provided code, but it appears to be empty. Action aborted.)_", mention_author=False)
-                         return
+                        logger.error("AI provided code, but it was empty after cleaning markdown.")
+                        await message.reply(f"{response_text}\n\n_(The AI provided code, but it appears to be empty. Action aborted.)_", mention_author=False)
+                        return
 
-                    await message.reply(response_text, mention_author=False) # Acknowledge with AI text
+                    # Send the AI's preliminary text response
+                    await message.reply(response_text, mention_author=False)
 
-                    # --- Execute Code via Jishaku ---
+                    # --- Execute Code Directly using Jishaku Internals ---
                     jsk_cog = bot.get_cog("Jishaku")
                     if not jsk_cog:
                         logger.critical("Jishaku cog not found. Cannot execute code.")
                         await message.channel.send("_(CRITICAL ERROR: Code execution module is unavailable.)_")
                         return
 
-                    py_command = bot.get_command("jsk py")
-                    if not py_command or not isinstance(py_command, commands.Command):
-                         logger.error("Could not find the 'jsk py' subcommand.")
-                         await message.channel.send("_(Error: Cannot locate the Python execution command.)_")
-                         return
-
-                    # Create a new context for the command invocation
-                    # This allows jsk to use its checks and setup
+                    # Create a new context for execution
                     ctx = await bot.get_context(message)
                     if not ctx:
                          logger.error("Failed to create command context for code execution.")
                          await message.channel.send("_(Error: Could not create execution context.)_")
                          return
 
-                    # Ensure the context knows which command we want to run
-                    ctx.command = py_command
+                    # Prepare the execution scope
+                    scope = Scope()
+                    scope.update(
+                        ctx=ctx, bot=bot, message=message, author=message.author,
+                        channel=message.channel, guild=message.guild, discord=discord,
+                        asyncio=asyncio, aiohttp=aiohttp, os=os, # Add others if needed
+                    )
 
-                    logger.info(f"Attempting code execution via Jishaku:\n---\n{code_to_execute}\n---")
+                    # Create the executor instance
+                    executor = AsyncCodeExecutor(code_to_execute, scope)
+
+                    logger.info(f"Attempting direct code execution via Jishaku executor:\n---\n{code_to_execute}\n---")
                     try:
-                        # Invoke 'jsk py' with the code as argument
-                        await ctx.invoke(py_command, argument=code_to_execute)
-                        logger.info(f"Code execution invoked via Jishaku for message {message.id}.")
-                    except commands.CommandError as cmd_err:
-                        # Jishaku usually sends feedback, log here for diagnostics
-                        logger.warning(f"CommandError during 'jsk py' invocation (Jishaku might have already reported it): {cmd_err}")
-                        # Optionally print traceback for debug: traceback.print_exc()
+                        # Use Jishaku's ReplResponseReactor to handle execution and response sending
+                        reactor = ReplResponseReactor(ctx, jsk_cog) # Pass ctx and the cog instance
+                        await reactor.execute_and_respond(executor) # Pass the executor
+                        logger.info(f"Direct code execution completed for message {message.id}.")
+
                     except Exception as exec_err:
-                        logger.error(f"Unexpected error invoking 'jsk py': {type(exec_err).__name__} - {exec_err}")
+                        # Catch errors *during* the setup/execution call (less likely here)
+                        logger.error(f"Unexpected error during Jishaku direct execution setup/call: {type(exec_err).__name__} - {exec_err}")
                         traceback.print_exc()
-                        await message.channel.send(f"_(Error during code execution setup: {exec_err})_")
+                        try:
+                             await message.channel.send(f"_(Error during code execution: `{exec_err}`)_")
+                        except discord.HTTPException:
+                             pass
+                # === END OF CORRECTED CODE EXECUTION BLOCK ===
 
                 else:
                     logger.warning(f"Received unknown AI response type: '{response_type}'")
                     await message.reply(f"{response_text}\n\n_(Received an unexpected response type '{response_type}'. Displaying as text.)_", mention_author=False)
 
-            # --- Outer Error Handling for Discord API issues ---
-            except discord.Forbidden:
-                 logger.warning(f"Missing permissions to reply/send messages/send files in {message.channel} ({message.guild.id}).")
+            # --- Outer Error Handling ---
+            except discord.Forbidden as e:
+                 logger.warning(f"Missing permissions in {message.channel} ({message.guild.id}): {e}")
             except discord.HTTPException as e:
-                 logger.error(f"Failed to send response/audio file due to Discord HTTP error: {e.status} - {e.text}")
+                 logger.error(f"Failed to send response/file due to Discord HTTP error: {e.status} - {e.text[:200]}")
                  try:
                      await message.channel.send("_(An error occurred while sending the response to Discord.)_")
                  except discord.HTTPException:
                      logger.error("Also failed to send fallback error message.")
             except Exception as e:
-                 logger.error(f"An unexpected error occurred during AI response processing: {type(e).__name__} - {e}")
+                 logger.error(f"Unexpected error during AI response processing: {type(e).__name__} - {e}")
                  traceback.print_exc()
                  try:
                      await message.channel.send("_(An unexpected internal error occurred processing the response.)_")
                  except discord.HTTPException:
                      logger.error("Also failed to send fallback error message after unexpected error.")
-
 
 # --- Run the Bot ---
 if __name__ == "__main__":
@@ -610,9 +600,6 @@ if __name__ == "__main__":
 
     try:
         logger.info("Starting bot...")
-        # Run the bot asynchronously using asyncio.run() which is standard now
-        # bot.run handles the event loop internally, but good practice for top-level async setup
-        # Pass None to log_handler as we configured logging manually
         async def runner():
             async with bot:
                 await bot.start(BOT_TOKEN, reconnect=True)
@@ -623,8 +610,9 @@ if __name__ == "__main__":
         logger.critical("FATAL ERROR: Invalid Discord Bot Token.")
         print("FATAL ERROR: Invalid Discord Bot Token provided.", file=sys.stderr)
     except discord.PrivilegedIntentsRequired as e:
-         logger.critical(f"FATAL ERROR: Privileged Intents ({e.shard_id or 'N/A'}) are not enabled. Go to the Discord Developer Portal, Bot section, and enable 'Message Content Intent' and 'Server Members Intent'.")
-         print(f"FATAL ERROR: Privileged Intents ({e.shard_id or 'N/A'}) are required but not enabled. Go to your bot's settings in the Discord Developer Portal and enable 'Message Content Intent' and 'Server Members Intent'.", file=sys.stderr)
+         intents_msg = f"FATAL ERROR: Privileged Intents (Shard ID: {e.shard_id or 'N/A'}) are required but not enabled. Go to your bot's settings in the Discord Developer Portal (Bot section) and enable 'Message Content Intent' and 'Server Members Intent'."
+         logger.critical(intents_msg)
+         print(intents_msg, file=sys.stderr)
     except Exception as e:
         logger.critical(f"FATAL ERROR: An unexpected error occurred while running the bot: {type(e).__name__} - {e}")
         print(f"FATAL ERROR: An error occurred while running the bot: {type(e).__name__} - {e}", file=sys.stderr)
